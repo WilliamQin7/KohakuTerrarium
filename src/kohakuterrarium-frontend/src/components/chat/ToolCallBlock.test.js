@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import ToolCallBlock from "./ToolCallBlock.vue"
 import { useChatStore } from "@/stores/chat"
-import { terrariumAPI } from "@/utils/api"
+import { sessionAPI, terrariumAPI } from "@/utils/api"
 
 beforeEach(() => {
   const values = new Map()
@@ -20,12 +20,12 @@ beforeEach(() => {
 // markdown-rendered text from raw monospace (tool / system) blocks.
 const MarkdownStub = { props: ["content"], template: `<div class="md">{{ content }}</div>` }
 
-function mountBlock(tc) {
+function mountBlock(tc, expanded = true) {
   const chat = useChatStore()
   chat._instanceGraphId = "g1"
   chat.activeTab = "root"
   const wrapper = mount(ToolCallBlock, {
-    props: { tc, expanded: true },
+    props: { tc, expanded },
     global: { stubs: { MarkdownRenderer: MarkdownStub } },
   })
   return wrapper
@@ -62,6 +62,125 @@ describe("ToolCallBlock — sub-agent model identity", () => {
   })
 })
 
+describe("ToolCallBlock — generated artifacts", () => {
+  it("previews generated images while the tool details stay collapsed", () => {
+    const imageUrl = "/api/sessions/s1/artifacts/generated_images/grok_123.jpeg"
+    const wrapper = mountBlock(
+      {
+        type: "tool",
+        id: "t-image-preview",
+        name: "grok_image_gen",
+        kind: "tool",
+        args: {},
+        status: "done",
+        result: imageUrl,
+        resultParts: [{ type: "image_url", image_url: { url: imageUrl } }],
+      },
+      false,
+    )
+
+    expect(wrapper.find(`img[src="${imageUrl}"]`).exists()).toBe(true)
+  })
+
+  it("previews generated videos while the tool details stay collapsed", () => {
+    const videoUrl = "/api/sessions/s1/artifacts/generated_videos/grok_123.mp4"
+    const wrapper = mountBlock(
+      {
+        type: "tool",
+        id: "t-video-preview",
+        name: "video_gen",
+        kind: "tool",
+        args: {},
+        status: "done",
+        result: videoUrl,
+        resultParts: [
+          {
+            type: "file",
+            file: { path: videoUrl, name: "grok_123.mp4", mime: "video/mp4" },
+          },
+        ],
+      },
+      false,
+    )
+
+    expect(wrapper.find(`video[src="${videoUrl}"]`).exists()).toBe(true)
+  })
+
+  it("does not preview media from non-artifact URLs", () => {
+    const wrapper = mountBlock(
+      {
+        type: "tool",
+        id: "t-unsafe-preview",
+        name: "grok_image_gen",
+        kind: "tool",
+        args: {},
+        status: "done",
+        result: "unsafe",
+        resultParts: [
+          { type: "image_url", image_url: { url: "javascript:alert(1)" } },
+          {
+            type: "file",
+            file: { path: "https://evil.invalid/video.mp4", mime: "video/mp4" },
+          },
+        ],
+      },
+      false,
+    )
+
+    expect(wrapper.find("img").exists()).toBe(false)
+    expect(wrapper.find("video").exists()).toBe(false)
+  })
+
+  it("shows stable relative paths as links", () => {
+    const wrapper = mountBlock({
+      type: "tool",
+      id: "t-artifact",
+      name: "grok_image_gen",
+      kind: "tool",
+      args: {},
+      status: "done",
+      result: "image",
+      resultMeta: {
+        artifacts: [
+          {
+            kind: "image",
+            relative_path: "generated_images/grok_123.jpeg",
+            url: "/api/sessions/s1/artifacts/generated_images/grok_123.jpeg",
+          },
+        ],
+      },
+    })
+
+    const link = wrapper.find('a[href*="generated_images/grok_123.jpeg"]')
+    expect(link.exists()).toBe(true)
+    expect(link.text()).toBe("generated_images/grok_123.jpeg")
+  })
+
+  it("does not render unsafe artifact links", () => {
+    const wrapper = mountBlock({
+      type: "tool",
+      id: "t-unsafe-artifact",
+      name: "grok_image_gen",
+      kind: "tool",
+      args: {},
+      status: "done",
+      result: "image",
+      resultMeta: {
+        artifacts: [
+          {
+            kind: "image",
+            relative_path: "generated_images/unsafe.jpeg",
+            url: "javascript:alert(1)",
+          },
+        ],
+      },
+    })
+
+    expect(wrapper.find("a").exists()).toBe(false)
+    expect(wrapper.text()).not.toContain("generated_images/unsafe.jpeg")
+  })
+})
+
 describe("ToolCallBlock — sub-agent conversation (UXI-05)", () => {
   it("shows the send box for ANY messageable sub-agent (gated on can_receive, not interactive) and targets by job_id", async () => {
     // ``interactive:false`` but ``can_receive:true`` — the box must still
@@ -79,7 +198,10 @@ describe("ToolCallBlock — sub-agent conversation (UXI-05)", () => {
     await flushPromises()
 
     // Live block identifies by the job_id it already holds.
-    expect(getConv).toHaveBeenCalledWith("g1", "root", { jobId: "job_x" })
+    expect(getConv).toHaveBeenCalledWith("g1", "root", {
+      jobId: "job_x",
+      name: "explore",
+    })
     const textarea = wrapper.find("textarea")
     expect(textarea.exists()).toBe(true)
     expect(textarea.classes()).toEqual(
@@ -105,6 +227,35 @@ describe("ToolCallBlock — sub-agent conversation (UXI-05)", () => {
 
     getConv.mockRestore()
     send.mockRestore()
+  })
+
+  it("uses the persisted viewer API inside saved session history", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "session:saved-session"
+    chat._instanceGraphId = null
+    chat.activeTab = "root"
+    const liveRead = vi.spyOn(terrariumAPI, "getSubagentConversation")
+    const savedRead = vi.spyOn(sessionAPI, "getSubagentConversation").mockResolvedValue({
+      live: false,
+      can_receive: false,
+      messages: [{ role: "assistant", content: "saved answer" }],
+    })
+
+    const wrapper = mountBlock(subagentTc())
+    await convButton(wrapper).trigger("click")
+    await flushPromises()
+
+    expect(liveRead).not.toHaveBeenCalled()
+    expect(savedRead).toHaveBeenCalledWith("saved-session", {
+      parent: "root",
+      jobId: "job_x",
+      name: "explore",
+    })
+    expect(wrapper.text()).toContain("saved answer")
+    expect(wrapper.find("textarea").exists()).toBe(false)
+
+    liveRead.mockRestore()
+    savedRead.mockRestore()
   })
 
   it("polls the open transcript while the run is live and stops once it settles", async () => {

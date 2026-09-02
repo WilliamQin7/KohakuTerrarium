@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from "pinia"
-import { computed, isReactive } from "vue"
+import { computed, isReactive, toRaw } from "vue"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { _parseSlashCommand, _replayEvents, useChatStore } from "./chat.js"
@@ -528,6 +528,31 @@ describe("chat store — slash commands", () => {
       "older history",
       "Goals",
     ])
+    getHistory.mockRestore()
+  })
+
+  it("passes one prepared history projection through the real Pinia resync path", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "session_1"
+    chat._instanceGraphId = "graph_1"
+    chat.messagesByTab = { kohaku: [] }
+    const events = [
+      { type: "user_input", content: "hello", event_id: 1, turn_index: 1, branch_id: 1 },
+      { type: "user_input", content: "hello", event_id: 2, turn_index: 1, branch_id: 1 },
+    ]
+    const importActual = await vi.importActual("@/utils/api")
+    const getHistory = vi
+      .spyOn(importActual.terrariumAPI, "getHistory")
+      .mockResolvedValue({ events, messages: [], is_processing: false })
+    const rebuild = vi.spyOn(chat, "_rebuildMessages")
+
+    await expect(chat._resyncHistory("kohaku")).resolves.toBe(true)
+
+    const prepared = rebuild.mock.calls[0][2]
+    expect(prepared.events).toBe(toRaw(chat.eventsByTab.kohaku))
+    expect(prepared.events).toHaveLength(1)
+    expect(prepared.branchMetadata.branchSelection).toEqual(new Map([[1, 1]]))
+    rebuild.mockRestore()
     getHistory.mockRestore()
   })
 
@@ -2337,7 +2362,7 @@ describe("chat store — multimodal edit + branch resync", () => {
 
     // Second poll: branch=2 events landed. Rebuild now safe; pending cleared.
     await expect(chat._resyncHistory("main")).resolves.toBe(true)
-    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number))
+    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number), expect.any(Object))
     expect(chat._branchResyncPendingByTab.main).toBeUndefined()
 
     rebuildSpy.mockRestore()
@@ -2397,7 +2422,7 @@ describe("chat store — multimodal edit + branch resync", () => {
     await chat._resyncHistory("main")
 
     expect(chat.branchViewByTab.main).toEqual({ 2: 1 })
-    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number))
+    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number), expect.any(Object))
 
     rebuildSpy.mockRestore()
     getHistory.mockRestore()
@@ -2457,6 +2482,8 @@ describe("chat store — resetForRouteSwitch", () => {
     expect(chat.sessionInfo.model).toBe("")
     expect(chat.sessionInfo.llmName).toBe("")
     expect(chat.sessionInfo.agentName).toBe("")
+    expect(chat.sessionInfo.configName).toBe("")
+    expect(chat.sessionInfo.configRef).toBe("")
     expect(chat.sessionInfo.compactThreshold).toBe(0)
     expect(chat.sessionInfo.maxContext).toBe(0)
 
@@ -2508,6 +2535,25 @@ describe("chat store — per-creature model info", () => {
     expect(chat.activeModelInfo.maxContext).toBe(200000)
   })
 
+  it("keeps config identity with the active creature tab", () => {
+    const chat = useChatStore()
+    chat.tabs = ["alice", "bob"]
+    chat.activeTab = "alice"
+    chat.sessionInfo.configName = "alice-config"
+    chat.sessionInfo.configRef = "creatures/alice.yaml"
+
+    chat._handleActivity("bob", {
+      activity_type: "session_info",
+      config_name: "bob-config",
+      config_ref: "creatures/bob.yaml",
+    })
+
+    expect(chat.activeCreatureInfo.configName).toBe("alice-config")
+    chat.activeTab = "bob"
+    expect(chat.activeCreatureInfo.configName).toBe("bob-config")
+    expect(chat.activeCreatureInfo.configRef).toBe("creatures/bob.yaml")
+  })
+
   it("session_info from the primary creature updates the global fallback", () => {
     const chat = useChatStore()
     chat.tabs = ["alice", "bob"]
@@ -2517,11 +2563,17 @@ describe("chat store — per-creature model info", () => {
       activity_type: "session_info",
       llm_name: "anthropic/claude-fable-5",
       session_id: "s-42",
+      agent_name: "warm-ember",
+      config_name: "swe",
+      config_ref: "@kt-biome/creatures/swe",
     })
 
     expect(chat.modelByTab.alice.llmName).toBe("anthropic/claude-fable-5")
     expect(chat.sessionInfo.llmName).toBe("anthropic/claude-fable-5")
     expect(chat.sessionInfo.sessionId).toBe("s-42")
+    expect(chat.sessionInfo.agentName).toBe("warm-ember")
+    expect(chat.sessionInfo.configName).toBe("swe")
+    expect(chat.sessionInfo.configRef).toBe("@kt-biome/creatures/swe")
     expect(chat.modelDisplay).toBe("anthropic/claude-fable-5")
   })
 
@@ -4155,6 +4207,73 @@ describe("chat store — canvas_preview WS frame → resultMeta (Feat 1)", () =>
   })
 })
 
+describe("chat store — generated artifact metadata", () => {
+  const artifacts = [
+    {
+      kind: "image",
+      relative_path: "generated_images/grok_1.jpeg",
+      url: "/api/sessions/s1/artifacts/generated_images/grok_1.jpeg",
+    },
+  ]
+
+  it("live tool_done frame surfaces artifact references", () => {
+    const chat = useChatStore()
+    chat.messagesByTab = {
+      main: [
+        {
+          id: "m1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool",
+              id: "tc_artifact",
+              jobId: "job_artifact_1",
+              name: "grok_image_gen",
+              kind: "tool",
+              args: {},
+              status: "running",
+              result: "",
+              tools_used: [],
+              children: [],
+            },
+          ],
+        },
+      ],
+    }
+    chat.activeTab = "main"
+
+    chat._handleActivity("main", {
+      activity_type: "tool_done",
+      name: "grok_image_gen",
+      job_id: "job_artifact_1",
+      output: "image",
+      tool_metadata: { artifacts },
+    })
+
+    expect(chat.messagesByTab.main[0].parts[0].resultMeta?.artifacts).toEqual(artifacts)
+  })
+
+  it("replay surfaces persisted artifact references", () => {
+    const { messages } = _replayEvents(
+      [],
+      [
+        { type: "processing_start" },
+        { type: "tool_call", name: "video_gen", call_id: "job_1", args: {} },
+        {
+          type: "tool_result",
+          name: "video_gen",
+          call_id: "job_1",
+          output: "video",
+          tool_metadata: { artifacts },
+        },
+        { type: "processing_end" },
+      ],
+    )
+
+    expect(messages[0].parts[0].resultMeta?.artifacts).toEqual(artifacts)
+  })
+})
+
 describe("chat store — branch isolation during streaming", () => {
   // Bug we're guarding against: user clicks Save & Rerun on turn 1.
   // Backend opens branch 2 and starts streaming. User clicks <1/2> to
@@ -4830,6 +4949,160 @@ describe("chat store — queued-message UI freeze regressions", () => {
     // forever with a "running" assistant bubble whose _streaming flag
     // was never cleared by a finaliser.
     expect(chat._streamingBranchByTab.main).toEqual({ turnIndex: 2, branchId: 1 })
+  })
+})
+
+describe("chat store — history attention race guards", () => {
+  it("does not let an older fetch erase a prompt that arrived live", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+    chat.branchViewByTab = {}
+
+    let resolveHistory
+    const importActual = await vi.importActual("@/utils/api")
+    const getHistorySpy = vi.spyOn(importActual.terrariumAPI, "getHistory").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveHistory = resolve
+        }),
+    )
+
+    const resync = chat._resyncHistory("main")
+    await vi.waitFor(() => expect(resolveHistory).toBeTypeOf("function"))
+    chat._onMessage({
+      type: "ask_text",
+      source: "main",
+      event_id: "live-prompt",
+      interactive: true,
+      surface: "chat",
+      payload: { prompt: "Live" },
+    })
+    resolveHistory({ events: [] })
+
+    await expect(resync).resolves.toBe(false)
+    expect(chat.attentionByTab.main.pending).toEqual(new Set(["live-prompt"]))
+    expect(chat.messagesByTab.main).toEqual(
+      expect.arrayContaining([expect.objectContaining({ eventId: "live-prompt" })]),
+    )
+
+    chat._clearBranchResyncTimers()
+    getHistorySpy.mockRestore()
+  })
+
+  it("does not let an older fetch resurrect a prompt resolved live", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+    chat.branchViewByTab = {}
+    chat._onMessage({
+      type: "ask_text",
+      source: "main",
+      event_id: "prompt-1",
+      interactive: true,
+      surface: "chat",
+      payload: { prompt: "Reply" },
+    })
+
+    let resolveHistory
+    const importActual = await vi.importActual("@/utils/api")
+    const getHistorySpy = vi.spyOn(importActual.terrariumAPI, "getHistory").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveHistory = resolve
+        }),
+    )
+
+    const resync = chat._resyncHistory("main")
+    await vi.waitFor(() => expect(resolveHistory).toBeTypeOf("function"))
+    chat._onMessage({ type: "ui_supersede", source: "main", event_id: "prompt-1" })
+    resolveHistory({
+      events: [
+        {
+          type: "ask_text",
+          event_id: 1,
+          ui_event_id: "prompt-1",
+          interactive: true,
+          surface: "chat",
+          payload: { prompt: "Reply" },
+        },
+      ],
+    })
+
+    await expect(resync).resolves.toBe(false)
+    expect(chat.attentionByTab.main.pending).toEqual(new Set())
+    expect(chat.messagesByTab.main.find((message) => message.eventId === "prompt-1")).toMatchObject(
+      {
+        superseded: true,
+      },
+    )
+
+    chat._clearBranchResyncTimers()
+    getHistorySpy.mockRestore()
+  })
+})
+
+describe("chat store — canonical history restores attention", () => {
+  it("restores only unresolved interactive prompts without emitting live effects", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+    chat.branchViewByTab = {}
+    chat._onMessage({ type: "processing_start", source: "main" })
+    chat._onMessage({ type: "processing_end", source: "main" })
+
+    const events = [
+      {
+        type: "confirm",
+        event_id: 1,
+        ui_event_id: "resolved",
+        interactive: true,
+        surface: "chat",
+        payload: { prompt: "Resolved?" },
+      },
+      { type: "ui_supersede", event_id: 2, ui_event_id: "resolved" },
+      {
+        type: "ask_text",
+        event_id: 3,
+        ui_event_id: "pending",
+        interactive: true,
+        surface: "chat",
+        payload: { prompt: "Still waiting" },
+      },
+      { type: "processing_start", event_id: 4 },
+      { type: "processing_end", event_id: 5 },
+    ]
+    const importActual = await vi.importActual("@/utils/api")
+    const getHistorySpy = vi
+      .spyOn(importActual.terrariumAPI, "getHistory")
+      .mockResolvedValue({ events })
+
+    await chat._resyncHistory("main")
+
+    expect(chat.attentionSummary("main")).toEqual({ pending: 1, completed: 1 })
+    expect(chat.attentionByTab.main.pending).toEqual(new Set(["pending"]))
+    expect(chat.attentionByTab.main.seen).toEqual(new Set(["resolved", "pending"]))
+    const resolved = chat.messagesByTab.main.find((message) => message.eventId === "resolved")
+    const pending = chat.messagesByTab.main.find((message) => message.eventId === "pending")
+    expect(resolved).toMatchObject({ role: "ui_event", superseded: true })
+    expect(pending).toMatchObject({
+      role: "ui_event",
+      tab: "main",
+      superseded: false,
+      replied: false,
+    })
+
+    chat._clearBranchResyncTimers()
+    getHistorySpy.mockRestore()
   })
 })
 

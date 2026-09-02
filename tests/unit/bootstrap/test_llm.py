@@ -21,6 +21,8 @@ from kohakuterrarium.bootstrap.llm import (
 from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
 from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok_auth import GrokToken
+from kohakuterrarium.llm.grok_provider import GrokSubscriptionProvider
 from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.llm.profile_types import LLMProfile
 
@@ -118,7 +120,9 @@ class TestCreateLLMProviderProfilePath:
             def __init__(self, **kw):
                 pass
 
-        monkeypatch.setattr(llm_mod, "CodexOAuthProvider", _StubProvider)
+        import kohakuterrarium.llm.codex_provider as codex_provider
+
+        monkeypatch.setattr(codex_provider, "CodexOAuthProvider", _StubProvider)
         cfg = AgentConfig(name="a", model="m")
         out = create_llm_provider(cfg)
         assert isinstance(out, _StubProvider)
@@ -217,6 +221,25 @@ class TestCreateLLMFromProfileName:
 
 
 class TestCreateFromProfile:
+    def test_grok_subscription_backend_builds_dedicated_provider(self, monkeypatch):
+        monkeypatch.setattr(
+            "kohakuterrarium.llm.grok_provider.GrokTokens.load_candidates",
+            lambda: [GrokToken(access_token="secret", source="grok-cli")],
+        )
+        profile = LLMProfile(
+            name="grok-4.6-subscription",
+            model="grok-4.6",
+            provider="grok-subscription",
+            backend_type="grok-subscription",
+            max_context=256000,
+        )
+
+        provider = _create_from_profile(profile)
+
+        assert isinstance(provider, GrokSubscriptionProvider)
+        assert provider.config.model == "grok-4.6"
+        assert provider._profile_max_context == 256000
+
     def test_openai_backend_builds_openai_provider(self, monkeypatch):
         monkeypatch.setattr(llm_mod, "get_api_key", lambda p: "k")
         profile = LLMProfile(
@@ -401,6 +424,21 @@ class TestApplyBackendNativeIdentity:
         assert p.provider_native_tools == frozenset(["x"])
         # provider_name was empty → not overwritten.
         assert p.provider_name == "default"
+
+    def test_spark_profile_constructs_without_image_generation(self):
+        profile = LLMProfile(
+            name="gpt-5.3-codex-spark",
+            model="gpt-5.3-codex-spark",
+            provider="codex",
+            backend_type="codex",
+            backend_provider_name="codex",
+            backend_native_tools=[],
+        )
+
+        provider = _create_from_profile(profile)
+
+        assert isinstance(provider, CodexOAuthProvider)
+        assert provider.provider_native_tools == frozenset()
 
 
 # ── fake_test backend — provider-resolution path for multi-node tests ─────

@@ -91,9 +91,11 @@ KohakuTerrarium 隨附的所有內建工具、子代理、輸入、輸出、使�
 
 - 參數：`url`。
 
-**`web_search`**：預設使用 DuckDuckGo，也可選擇 DeepSeek Responses
-搜尋後端。DeepSeek 需先執行 `kt config key set deepseek`，再透過
-`/module set web_search backend deepseek` 為目前 Creature 啟用。直接執行。
+**`web_search`**：預設使用 DuckDuckGo，也可明確選擇 Codex 訂閱或
+DeepSeek Responses 後端。執行 `kt login codex` 後可設定
+`backend: codex`；此後端與目前 Creature 主模型無關。DeepSeek 需先執行
+`kt config key set deepseek`，再設定 `backend: deepseek`。兩個明確選擇的
+Provider 後端均可設定 `fallback: duckduckgo` 處理暫時故障。直接執行。
 
 - 參數：`query`、`max_results`（int）、`region`（str）。
 
@@ -323,6 +325,7 @@ LLM 可輸出的內嵌指令，可取代工具呼叫。它們會直接與框架�
 
 ### OpenAI 透過 Codex OAuth
 
+- `gpt-5.3-codex-spark`（ChatGPT Pro 研究預覽；僅文字）
 - `gpt-5.4` (別名：`gpt5`、`gpt54`)
 - `gpt-5.3-codex` (`gpt53`)
 - `gpt-5.1`
@@ -473,6 +476,7 @@ Variation group 讓單一 preset 暴露多組旋鈕而不用重複建立條目�
 
 | Preset | Group | Options |
 |---|---|---|
+| `gpt-5.3-codex-spark` | `reasoning` | `low`、`medium`、`high`、`xhigh` |
 | `gpt-5.4` | `reasoning` | `none`、`low`、`medium`、`high`、`xhigh` |
 | `gpt-5.4` | `speed` | `normal`、`fast` (對映 `service_tier: priority`) |
 | `gpt-5.3-codex` | `reasoning` | `none`、`low`、`medium`、`high`、`xhigh` |

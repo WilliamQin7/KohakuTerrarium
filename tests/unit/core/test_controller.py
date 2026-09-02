@@ -22,12 +22,13 @@ from kohakuterrarium.core.events import (
 )
 from kohakuterrarium.core.job import JobResult
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.llm.message import ImagePart
+from kohakuterrarium.llm.message import FilePart, ImagePart
 from kohakuterrarium.parsing.events import (
     TextEvent,
 )
 from kohakuterrarium.testing.agent import TestAgentBuilder
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from kohakuterrarium.utils.file_guard import PathBoundaryGuard
 
 # ── _merge_text_and_parts ────────────────────────────────────────
 
@@ -479,14 +480,50 @@ class TestFormatEventsForContext:
         assert out[0].text == "describe"
 
     def test_tool_complete_text(self):
-        from kohakuterrarium.core.events import create_tool_complete_event
-
         c = self._ctrl()
         evt = create_tool_complete_event(job_id="bash_x", content="output", exit_code=0)
         out = c._format_events_for_context([evt])
-        # Contains the tool-complete header and the body.
-        assert "Tool bash_x" in out
-        assert "output" in out
+        assert out == "[Tool bash_x completed]\noutput"
+
+    def test_tool_failure_keeps_only_actionable_error(self):
+        c = self._ctrl()
+        evt = create_tool_complete_event(
+            job_id="bash_x",
+            content="partial output",
+            exit_code=2,
+            error=(
+                "\x1b[31mTraceback (most recent call last):\n"
+                '  File "worker.py", line 9, in run\n'
+                "RuntimeError: background-kaboom\x1b[0m"
+            ),
+        )
+        out = c._format_events_for_context([evt])
+        assert out == (
+            "[Tool bash_x failed, exit 2]\n"
+            "Error: RuntimeError: background-kaboom\n"
+            "partial output"
+        )
+        assert "Traceback" not in out
+        assert "worker.py" not in out
+
+    def test_tool_failure_error_is_bounded(self):
+        c = self._ctrl()
+        evt = create_tool_complete_event(job_id="bash_x", content="", error="x" * 600)
+        out = c._format_events_for_context([evt])
+        summary = out.split("Error: ", 1)[1]
+        assert len(summary) == 512
+        assert summary.endswith("…")
+
+    def test_interrupted_tool_is_cancelled_without_redundant_error(self):
+        c = self._ctrl()
+        evt = create_tool_complete_event(
+            job_id="bash_x",
+            content="",
+            error="User manually interrupted this job.",
+            interrupted=True,
+            final_state="interrupted",
+        )
+        assert c._format_events_for_context([evt]) == "[Tool bash_x cancelled]"
 
     def test_subagent_output(self):
         from kohakuterrarium.core.events import EventType
@@ -638,6 +675,37 @@ class TestMaterializeInlineFile:
         path = await env.controller._materialize_inline_file(part)
         assert path is None
 
+    async def test_same_upload_reuses_path_until_controller_cleanup(self):
+        from pathlib import Path
+
+        env = TestAgentBuilder().with_llm_script(["x"]).build()
+        part = FilePart(name="notes.txt", content="stable", is_inline=True)
+
+        first = await env.controller._materialize_inline_file(part)
+        second = await env.controller._materialize_inline_file(part)
+
+        assert first == second
+        assert Path(first).is_file()
+
+        env.controller.cleanup_inline_files()
+
+        assert not Path(first).exists()
+
+    async def test_long_upload_name_still_materializes(self):
+        from pathlib import Path
+
+        env = TestAgentBuilder().with_llm_script(["x"]).build()
+        part = FilePart(
+            name=f"{'x' * 255}.txt",
+            content="long name",
+            is_inline=True,
+        )
+
+        path = await env.controller._materialize_inline_file(part)
+
+        assert Path(path).read_text() == "long name"
+        assert len(Path(path).name.encode()) <= 255
+
 
 class TestResolveFilePart:
     async def test_inline_content_returns_text(self):
@@ -677,21 +745,55 @@ class TestResolveFilePart:
         joined = " ".join(getattr(p, "text", "") for p in out)
         assert "File read failed" in joined or "missing" in joined.lower()
 
-    async def test_inline_base64_materialised_to_temp(self):
+    async def test_inline_base64_allows_exact_live_session_copy(self, tmp_path):
         import base64
+        from pathlib import Path
 
-        from kohakuterrarium.llm.message import FilePart
+        from kohakuterrarium.builtins.tools.write import WriteTool
+        from kohakuterrarium.utils.file_guard import FileReadState
 
         env = TestAgentBuilder().with_llm_script(["x"]).build()
+        env.executor._file_read_state = FileReadState()
+        guard = PathBoundaryGuard(
+            env.executor._build_tool_context().working_dir, mode="warn"
+        )
+        env.executor._path_guard = guard
         part = FilePart(
             name="x.txt",
             data_base64=base64.b64encode(b"hello world").decode(),
             is_inline=True,
         )
         out = await env.controller._resolve_file_part(part)
-        # The inline file part is materialised then read back through
-        # ReadTool — the resolved output is a non-empty parts list.
-        assert out
+        joined = " ".join(getattr(p, "text", "") for p in out)
+        assert "hello world" in joined
+        path = joined.split("Path: ", 1)[1].split()[0]
+        assert Path(path).is_file()
+        assert guard.session_allowed_paths == frozenset({str(Path(path).resolve())})
+        assert guard._warned_paths == set()
+        assert env.executor._build_tool_context().path_guard is guard
+
+        written = await WriteTool().execute(
+            {"path": path, "content": "updated attachment"},
+            context=env.executor._build_tool_context(),
+        )
+        assert written.success
+        reread = await env.controller._resolve_file_part(part)
+        reread_text = " ".join(getattr(p, "text", "") for p in reread)
+        assert "updated attachment" in reread_text
+        assert f"Path: {path}" in reread_text
+
+        unrelated = tmp_path / "outside.txt"
+        unrelated.write_text("must stay guarded")
+        blocked = await env.controller._resolve_file_part(
+            FilePart(name="outside.txt", path=str(unrelated))
+        )
+        blocked_text = " ".join(getattr(p, "text", "") for p in blocked)
+        assert "outside the working directory" in blocked_text
+        assert str(unrelated.resolve()) in guard._warned_paths
+
+        env.controller.cleanup_inline_files()
+        assert not Path(path).exists()
+        assert guard.session_allowed_paths == frozenset()
 
 
 # ── _resolve_message_files multiple files + dispatch ─────────────
@@ -1005,11 +1107,28 @@ class TestNativeCompletion:
         await env.controller.push_event(create_user_input_event("go"))
         events: list = []
         async for evt in env.controller.run_once():
+            from kohakuterrarium.parsing import ToolCallEvent as TCE
+
+            if isinstance(evt, TCE):
+                # The provider's assistant call announcement must already be in
+                # history before a background handler can append its tool result.
+                assistant = env.controller.conversation.get_messages()[-1]
+                assert assistant.role == "assistant"
+                assert assistant.tool_calls is not None
+                assert assistant.tool_calls[0]["id"] == "c1"
+                env.controller.conversation.append(
+                    "tool", "done", tool_call_id=evt.args["_tool_call_id"]
+                )
             events.append(evt)
         # Yielded ToolCallEvent for the native call.
         from kohakuterrarium.parsing import ToolCallEvent as TCE
 
         assert any(isinstance(e, TCE) and e.name == "echo" for e in events)
+        wire_messages = env.controller.conversation.to_messages()
+        assert [message["role"] for message in wire_messages[-2:]] == [
+            "assistant",
+            "tool",
+        ]
 
     async def test_native_subagent_call_emitted(self):
         llm = _NativeScriptedLLM(
@@ -1023,10 +1142,46 @@ class TestNativeCompletion:
         await env.controller.push_event(create_user_input_event("go"))
         events: list = []
         async for evt in env.controller.run_once():
+            from kohakuterrarium.parsing import SubAgentCallEvent as SCE
+
+            if isinstance(evt, SCE):
+                assistant = env.controller.conversation.get_messages()[-1]
+                assert assistant.role == "assistant"
+                assert assistant.tool_calls is not None
+                assert assistant.tool_calls[0]["id"] == "c1"
             events.append(evt)
         from kohakuterrarium.parsing import SubAgentCallEvent as SCE
 
         assert any(isinstance(e, SCE) and e.name == "explore" for e in events)
+
+    async def test_all_native_calls_are_announced_before_first_dispatch(self):
+        llm = _NativeScriptedLLM(
+            [
+                (
+                    "Two calls.",
+                    [
+                        _NativeToolCall("c1", "echo", '{"msg": "left"}'),
+                        _NativeToolCall("c2", "echo", '{"msg": "right"}'),
+                    ],
+                ),
+            ]
+        )
+        env = TestAgentBuilder().with_llm(llm).build()
+        env.controller.config.tool_format = "native"
+        env.registry.register_tool(_DummyEchoTool())
+        await env.controller.push_event(create_user_input_event("go"))
+
+        from kohakuterrarium.parsing import ToolCallEvent as TCE
+
+        events = [event async for event in env.controller.run_once()]
+        assistant = env.controller.conversation.get_messages()[-1]
+        assert [call["id"] for call in assistant.tool_calls] == ["c1", "c2"]
+        assert [
+            event.args["_tool_call_id"] for event in events if isinstance(event, TCE)
+        ] == [
+            "c1",
+            "c2",
+        ]
 
     async def test_native_completion_no_tool_calls(self):
         llm = _NativeScriptedLLM([("Just a chat response.", [])])

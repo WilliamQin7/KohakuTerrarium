@@ -1261,6 +1261,17 @@ class TestCoreIntegration:
                 if j.job_id.startswith("bgboom_")
             )
             assert bgboom_status.state.value == "error"
+            bg_provider_call = agent.llm.call_log[-1]
+            bg_user_message = [
+                message for message in bg_provider_call if message.get("role") == "user"
+            ][-1]
+            assert bg_user_message["content"].endswith(
+                f"[Tool {bgboom_status.job_id} failed]\n" "Error: background-kaboom"
+            )
+            assert (
+                f"[Tool {bgboom_status.job_id} completed]"
+                not in bg_user_message["content"]
+            )
             # ``executor.wait_all`` drains every tracked task and returns
             # the completed JobResults — the bg job's result carries its
             # error string.
@@ -1308,6 +1319,27 @@ class TestCoreIntegration:
             assert "original reply" in _assistant_text(agent)
             assert agent._turn_index == 1
             assert agent._branch_id == 1
+
+            # Persist the native-tool event shape produced by a background
+            # completion. The event log records the call and result, while
+            # the assistant announcement is reconstructed for replay.
+            replay_call_id = "bash_history_replay_1"
+            store.append_event(
+                agent.config.name,
+                "tool_call",
+                {"name": "bash", "call_id": replay_call_id, "args": {"cmd": "pwd"}},
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
+            store.append_event(
+                agent.config.name,
+                "tool_result",
+                {"name": "bash", "call_id": replay_call_id, "output": "/work"},
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
 
             # --- regenerate: same user msg, new branch -----------------
             await agent.regenerate_last_response()
@@ -1409,6 +1441,17 @@ class TestCoreIntegration:
             }
             budget_plugin = agent.plugins.get_plugin("budget")
             assert budget_plugin.options["turn_budget"] == {"soft": 2, "hard": 5}
+            for field in ("soft", "hard"):
+                for non_finite in (float("nan"), float("inf"), float("-inf")):
+                    invalid = {"soft": 2, "hard": 5, field: non_finite}
+                    with pytest.raises(ValueError, match="finite"):
+                        agent.plugin_options.set("budget", {"turn_budget": invalid})
+                    assert budget_plugin.options["turn_budget"] == {
+                        "soft": 2,
+                        "hard": 5,
+                    }
+                    assert budget_plugin.budgets.turn.soft == 2
+                    assert budget_plugin.budgets.turn.hard == 5
             # The override was persisted to private session state.
             saved = store.state.get("solo:plugin_options")
             assert saved["budget"]["turn_budget"] == {"soft": 2, "hard": 5}
@@ -1476,6 +1519,17 @@ class TestCoreIntegration:
             )
             assert "first question" in replayed
             assert "original reply" in replayed
+            replay_messages = agent.controller.conversation.get_messages()
+            replay_tool_index = next(
+                i
+                for i, message in enumerate(replay_messages)
+                if message.role == "tool" and message.tool_call_id == replay_call_id
+            )
+            replay_announcement = replay_messages[replay_tool_index - 1]
+            assert replay_announcement.role == "assistant"
+            assert replay_call_id in {
+                call["id"] for call in replay_announcement.tool_calls
+            }
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
@@ -1639,11 +1693,9 @@ class TestCoreIntegration:
             assert agent.controller.conversation.get_image_count() == 1
 
             # --- inline-file user input through inject_input -----------
-            # A ``FilePart`` carrying literal ``content`` (no path, not
-            # flagged ``is_inline``) is resolved by the controller's
-            # ``_resolve_message_files`` straight into a plain text part
-            # — the ``File: <name>\n<content>`` form the provider sees.
-            # The scripted reply is keyed on a substring of that content.
+            # Browser-style text uploads are materialized once for the live
+            # session. The provider sees both their content and the stable
+            # path that later read/write calls can use.
             file_llm = ScriptedLLM(
                 [ScriptEntry("read the attached file", match="inline-file-marker")]
             )
@@ -1655,6 +1707,7 @@ class TestCoreIntegration:
                     FilePart(
                         name="notes.txt",
                         content="inline-file-marker: hello from the file",
+                        is_inline=True,
                     ),
                 ],
                 source="chat",
@@ -1668,6 +1721,82 @@ class TestCoreIntegration:
                 str(m.get("content", "")) for m in file_call_msgs
             )
             assert "inline-file-marker" in joined_file_call
+            assert "Attached file: notes.txt" in joined_file_call
+            text_path = next(
+                part["text"].split("Path: ", 1)[1]
+                for message in file_call_msgs
+                if isinstance(message.get("content"), list)
+                for part in message["content"]
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and "Attached file: notes.txt\nPath: " in part.get("text", "")
+            )
+            assert Path(text_path).is_file()
+            assert agent._path_guard.check(text_path) is None
+
+            # A browser-style inline image attachment is controller-owned:
+            # it is materialized outside the workspace, retained for the live
+            # session, and delivered through the normal ReadTool validation path.
+            png_b64 = (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8"
+                "AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+            )
+            image_file_llm = ScriptedLLM(
+                [ScriptEntry("saw inline png", match="inspect-inline-png")]
+            )
+            agent.llm = image_file_llm
+            agent.controller.llm = image_file_llm
+            await agent.inject_input(
+                [
+                    TextPart(text="inspect-inline-png"),
+                    FilePart(
+                        name="pixel.png",
+                        mime="image/png",
+                        data_base64=png_b64,
+                        is_inline=True,
+                    ),
+                ],
+                source="chat",
+            )
+            assert image_file_llm.call_count == 1
+            assert "saw inline png" in _assistant_text(agent)
+            image_user_message = [
+                message
+                for message in image_file_llm.call_log[-1]
+                if message.get("role") == "user"
+            ][-1]
+            image_call_parts = [
+                part for part in image_user_message["content"] if isinstance(part, dict)
+            ]
+            assert any(
+                part.get("type") == "image_url"
+                and part.get("image_url", {})
+                .get("url", "")
+                .startswith("data:image/png;base64,")
+                for part in image_call_parts
+            ), image_call_parts
+            assert not any(
+                "File read failed" in str(part.get("text", ""))
+                for part in image_call_parts
+            )
+            image_path = next(
+                part["text"].split("Path: ", 1)[1]
+                for part in image_call_parts
+                if part.get("type") == "text"
+                and "Attached file: pixel.png\nPath: " in part.get("text", "")
+            )
+            assert Path(image_path).is_file()
+            resolved_again = await agent.controller._resolve_message_files(
+                agent.controller.conversation.to_messages()
+            )
+            assert any(
+                part.get("type") == "text"
+                and part.get("text") == f"Attached file: pixel.png\nPath: {image_path}"
+                for message in resolved_again
+                if isinstance(message.get("content"), list)
+                for part in message["content"]
+                if isinstance(part, dict)
+            )
 
             # --- run_event: correlated custom-event ingress (Phase E) ---
             # ``Agent.run_event`` drives a pre-built TriggerEvent (a Drive

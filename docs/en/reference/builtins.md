@@ -107,9 +107,12 @@ timeout. Direct.
 
 - Args: `url`.
 
-**`web_search`**: Web search with a DuckDuckGo default and an optional
-DeepSeek Responses backend. DeepSeek requires `kt config key set deepseek`;
-switch per creature with `/module set web_search backend deepseek`. Direct.
+**`web_search`**: Web search with a DuckDuckGo default plus optional Codex
+subscription and DeepSeek Responses backends. After `kt login codex`, select
+`backend: codex`; this works independently of the creature's active LLM.
+DeepSeek requires `kt config key set deepseek` and `backend: deepseek`. Either
+explicit provider backend can use `fallback: duckduckgo` for transient
+failures. Direct.
 
 - Args: `query`, `max_results` (int), `region` (str).
 
@@ -386,6 +389,7 @@ Naming convention (post-2026-04 refactor):
 
 ### OpenAI via Codex OAuth
 
+- `gpt-5.3-codex-spark` (ChatGPT Pro research preview; text-only)
 - `gpt-5.5`
 - `gpt-5.4` (aliases: `gpt5`, `gpt54`)
 - `gpt-5.3-codex` (`gpt53`)
@@ -547,6 +551,7 @@ fixed.
 
 | Preset | Group | Options |
 |---|---|---|
+| `gpt-5.3-codex-spark` | `reasoning` | `low`, `medium`, `high`, `xhigh` |
 | `gpt-5.5` | `reasoning` | `none`, `low`, `medium`, `high`, `xhigh` |
 | `gpt-5.5` | `speed` | `normal`, `fast` (maps to `service_tier: priority`) |
 | `gpt-5.4` | `reasoning` | `none`, `low`, `medium`, `high`, `xhigh` |

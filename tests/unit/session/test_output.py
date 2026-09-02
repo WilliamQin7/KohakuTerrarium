@@ -598,6 +598,31 @@ class TestActivityHandlers:
         finally:
             store.close()
 
+    def test_tool_done_preserves_structured_media_output(self, tmp_path):
+        store, out = _make(tmp_path)
+        result = [
+            {
+                "type": "file",
+                "file": {
+                    "path": "/api/sessions/s1/artifacts/generated_videos/x.mp4",
+                    "mime": "video/mp4",
+                },
+            }
+        ]
+        try:
+            out.on_activity_with_metadata(
+                "tool_done",
+                "[video_gen] done",
+                {"job_id": "j1", "result": result},
+            )
+            store.flush()
+            evt = next(
+                e for e in store.get_events("alice") if e["type"] == "tool_result"
+            )
+            assert evt["output"] == result
+        finally:
+            store.close()
+
     def test_tool_done_preserves_explicit_exit_code(self, tmp_path):
         store, out = _make(tmp_path)
         try:
@@ -672,6 +697,50 @@ class TestActivityHandlers:
             parsed = json.loads(convo)
             assert parsed[0]["role"] == "user"
             assert parsed[1]["content"] == "found"
+            assert store.load_subagent_meta("alice", "explore", 0)["job_id"] == "j1"
+        finally:
+            store.close()
+
+    def test_subagent_done_does_not_duplicate_exact_managed_run(self, tmp_path):
+        store, out = _make(tmp_path)
+        try:
+            store.save_subagent(
+                "alice",
+                "explore",
+                0,
+                {
+                    "job_id": "agent_explore_abc12345",
+                    "task": "find x",
+                    "success": True,
+                },
+                conv_json='{"messages":[{"role":"assistant","content":"full"}]}',
+            )
+            out.on_activity_with_metadata(
+                "subagent_start",
+                "[explore] task",
+                {
+                    "job_id": "agent_explore_abc12345",
+                    "task": "find x",
+                    "subagent": "explore",
+                },
+            )
+            out.on_activity_with_metadata(
+                "subagent_done",
+                "[explore] done",
+                {
+                    "job_id": "agent_explore_abc12345",
+                    "result": "found",
+                    "subagent": "explore",
+                },
+            )
+
+            runs = store.list_subagent_runs(parent="alice", name="explore")
+            assert [(row["run"], row["job_id"]) for row in runs] == [
+                (0, "agent_explore_abc12345")
+            ]
+            assert store.load_subagent_conversation("alice", "explore", 0).endswith(
+                '"full"}]}'
+            )
         finally:
             store.close()
 
@@ -1097,6 +1166,31 @@ class TestEmitMatch:
                 e for e in store.get_events("alice") if e["type"] == "assistant_image"
             ]
             assert evts[0]["url"] == "u"
+        finally:
+            store.close()
+
+    async def test_interactive_lifecycle_keeps_stable_ui_event_id(self, tmp_path):
+        store, out = _make(tmp_path)
+        try:
+            await out.emit(
+                OutputEvent(
+                    type="confirm",
+                    id="confirm-1",
+                    interactive=True,
+                    payload={"prompt": "Continue?"},
+                )
+            )
+            out.on_supersede("confirm-1")
+            store.flush()
+
+            events = store.get_events("alice")
+            prompt = next(e for e in events if e["type"] == "confirm")
+            terminal = next(e for e in events if e["type"] == "ui_supersede")
+            assert prompt["ui_event_id"] == "confirm-1"
+            assert prompt["event_id"] != "confirm-1"
+            assert prompt["interactive"] is True
+            assert prompt["payload"] == {"prompt": "Continue?"}
+            assert terminal["ui_event_id"] == "confirm-1"
         finally:
             store.close()
 

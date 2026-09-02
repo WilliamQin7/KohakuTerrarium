@@ -29,6 +29,7 @@ from kohakuterrarium.core.environment import Environment
 from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.turn import AgentEventStream, TurnResult
 from kohakuterrarium.llm.profiles import _login_provider_for
+from kohakuterrarium.packages.walk import package_snapshot
 from kohakuterrarium.terrarium.config import CreatureConfig
 from kohakuterrarium.terrarium.creature_ids import _safe_creature_id
 from kohakuterrarium.terrarium.output_log import LogEntry, OutputLogCapture
@@ -74,6 +75,8 @@ class Creature:
     config: Any = None
     config_snapshot: dict[str, Any] | None = None
     source_ref: str | None = None
+    config_name: str = ""
+    config_ref: str | None = None
     build_pwd: str = ""
     injected_runtime: tuple[str, ...] = ()
     listen_channels: list[str] = field(default_factory=list)
@@ -610,6 +613,8 @@ class Creature:
             "creature_id": self.creature_id,
             "graph_id": self.graph_id,
             "name": self.name,
+            "config_name": self.config_name,
+            "config_ref": self.config_ref,
             "model": model,
             "llm_name": llm_identifier,
             "provider": provider,
@@ -687,6 +692,8 @@ def _build_provenance(
     return {
         "config_snapshot": config_snapshot,
         "source_ref": source_ref,
+        "config_name": str(getattr(agent.config, "name", "") or ""),
+        "config_ref": source_ref,
         "build_pwd": str(
             getattr(getattr(agent, "executor", None), "_working_dir", None)
             or os.getcwd()
@@ -724,6 +731,9 @@ def apply_creature_name(creature: "Creature", name: str) -> None:
     compact_manager = getattr(agent, "compact_manager", None)
     if compact_manager is not None and hasattr(compact_manager, "_agent_name"):
         compact_manager._agent_name = name
+    subagent_manager = getattr(agent, "subagent_manager", None)
+    if subagent_manager is not None and hasattr(subagent_manager, "_parent_name"):
+        subagent_manager._parent_name = name
     # A SessionOutput attached BEFORE the rename keeps recording events
     # under the old name — but the history/read side resolves events by
     # the creature's display name, so the rename must follow it onto the
@@ -784,6 +794,34 @@ def build_creature(
     """
     if io not in ("config", "none", "headless"):
         raise ValueError(f"io= must be 'config', 'none', or 'headless' — got {io!r}")
+    with package_snapshot():
+        return _build_creature_from_config(
+            config,
+            creature_id=creature_id,
+            graph_id=graph_id,
+            pwd=pwd,
+            llm=llm,
+            environment=environment,
+            io=io,
+            strict=strict,
+            tools=tools,
+            plugins=plugins,
+        )
+
+
+def _build_creature_from_config(
+    config: CreatureBuildInput,
+    *,
+    creature_id: str | None,
+    graph_id: str,
+    pwd: str | None,
+    llm: Any,
+    environment: Environment | None,
+    io: str,
+    strict: bool,
+    tools: list[Any] | None,
+    plugins: list[Any] | None,
+) -> Creature:
     _io_override = NoneInput() if io in ("none", "headless") else None
     _out_override = NoneOutput() if io == "headless" else None
     if isinstance(config, (str, Path)):

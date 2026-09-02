@@ -368,12 +368,36 @@ class SessionOutput(OutputModule):
             case "resume_batch":
                 # Replay batches are consumed by readers, not persisted again.
                 pass
+            case "ask_text" | "confirm" | "selection" | "card":
+                if not self._capture_activity:
+                    return
+                self._record(
+                    event.type,
+                    {
+                        "ui_event_id": event.id,
+                        "interactive": bool(event.interactive),
+                        "surface": event.surface,
+                        "payload": dict(event.payload),
+                    },
+                )
+            case "ui_supersede":
+                if not self._capture_activity:
+                    return
+                self._record(
+                    "ui_supersede",
+                    {"ui_event_id": event.payload.get("event_id")},
+                )
             case _:
                 if not self._capture_activity:
                     return
                 detail = event.content if isinstance(event.content, str) else ""
                 name, info = _parse_detail(detail)
                 self._record_activity(event.type, name, info, event.payload or {})
+
+    def on_supersede(self, event_id: str) -> None:
+        """Persist the terminal lifecycle marker used by history reconstruction."""
+        if self._capture_activity:
+            self._record("ui_supersede", {"ui_event_id": event_id})
 
     # String targets keep activity dispatch declarative at class scope.
     _ACTIVITY_HANDLERS: dict[str, str] = {
@@ -594,7 +618,12 @@ class SessionOutput(OutputModule):
         task_record = self._subagent_tasks.pop(job_id, None)
         task_text = task_record.get("task", "") if task_record is not None else ""
         try:
-            # Never replace a full managed conversation with a synthetic stub.
+            find_run = getattr(self._store, "find_subagent_run", None)
+            if (
+                callable(find_run)
+                and find_run(job_id, parent=self._agent_name) is not None
+            ):
+                return
             run = self._store.next_subagent_run(self._agent_name, name)
             convo = [
                 {"role": "user", "content": task_text},
@@ -605,6 +634,7 @@ class SessionOutput(OutputModule):
                 name=name,
                 run=run,
                 meta={
+                    "job_id": job_id,
                     "task": task_text,
                     "turns": metadata.get("turns", 0),
                     "tools_used": metadata.get("tools_used", []),

@@ -1,8 +1,17 @@
 import { ElMessage } from "element-plus"
 import { getCurrentInstance, markRaw } from "vue"
 
-import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
 import { injectScope, registerScopeDisposer, scopeOfStoreId } from "@/composables/useScope"
+import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
+import {
+  attentionSummary,
+  createAttentionState,
+  markAttentionRead,
+  publishAttention,
+  reduceAttentionEdge,
+  removeAttentionScope,
+  restoreAttentionFromHistory,
+} from "@/stores/attention"
 import {
   adoptLocalCommandResultSelections,
   bindLocalCommandResultContexts,
@@ -219,6 +228,9 @@ function toolResultPayload(result, data = {}) {
   if (data.canvas_preview && (!resultMeta || !resultMeta.canvas_preview)) {
     resultMeta = { ...(resultMeta || {}), canvas_preview: data.canvas_preview }
   }
+  if (data.tool_metadata) {
+    resultMeta = { ...(resultMeta || {}), ...data.tool_metadata }
+  }
   const parts = normalizeContentParts(result)
   return {
     result,
@@ -369,9 +381,10 @@ function _indexParentPaths(events) {
     const ti = evt?.turn_index
     const bi = evt?.branch_id
     const eid = evt?.event_id
+    const hasExplicitPath = Array.isArray(evt?.parent_branch_path)
     const explicit = _coercePath(evt?.parent_branch_path)
     if (typeof eid === "number") {
-      if (explicit.length) {
+      if (hasExplicitPath) {
         paths.set(eid, explicit)
       } else if (typeof ti === "number") {
         const snap = []
@@ -390,9 +403,9 @@ function _indexParentPaths(events) {
   return paths
 }
 
-function _pathMatches(path, selected) {
+function _pathMatches(path, selected, beforeTurn = Infinity) {
   for (const [t, b] of path) {
-    if (selected.has(t) && selected.get(t) !== b) return false
+    if (t < beforeTurn && selected.has(t) && selected.get(t) !== b) return false
   }
   return true
 }
@@ -458,9 +471,7 @@ export function _collectBranchMetadata(events, branchView = null) {
     const eid = evt?.event_id
     if (typeof ti !== "number" || typeof bi !== "number") continue
     const path = typeof eid === "number" ? parentPaths.get(eid) || [] : []
-    const priorSelected = new Map()
-    for (const [t, b] of branchSelection) if (t < ti) priorSelected.set(t, b)
-    if (!_pathMatches(path, priorSelected)) continue
+    if (!_pathMatches(path, branchSelection, ti)) continue
     let bucket = byTurn.get(ti)
     if (!bucket) {
       bucket = { branches: [], latestBranch: 0, eventIdsByBranch: new Map() }
@@ -487,9 +498,7 @@ export function _collectBranchMetadata(events, branchView = null) {
     }
     if (branchSelection.get(ti) !== bi) continue
     const path = parentPaths.get(eid) || []
-    const priorSelected = new Map()
-    for (const [t, b] of branchSelection) if (t < ti) priorSelected.set(t, b)
-    if (!_pathMatches(path, priorSelected)) continue
+    if (!_pathMatches(path, branchSelection, ti)) continue
     liveIds.add(eid)
   }
   return { byTurn, liveIds, branchSelection }
@@ -526,7 +535,19 @@ function _dedupeAdjacentDuplicateEvents(events) {
   return out
 }
 
-export function _replayEvents(messages, events, branchView = null) {
+export function _prepareReplayEvents(events, branchView = null) {
+  const dedupedEvents = _dedupeAdjacentDuplicateEvents(events)
+  return {
+    events: dedupedEvents,
+    branchMetadata: _collectBranchMetadata(dedupedEvents, branchView),
+  }
+}
+
+export function _replayEvents(messages, events, branchView = null, tab = "") {
+  return _replayPreparedEvents(messages, _prepareReplayEvents(events, branchView), tab)
+}
+
+function _replayPreparedEvents(messages, prepared, tab = "") {
   // A terminal event is authoritative: liveness comes from the backend,
   // which withholds a job's terminal (``normalize_resumable_events`` with
   // ``live_job_ids``) for as long as it sees the job running. A job with
@@ -535,10 +556,17 @@ export function _replayEvents(messages, events, branchView = null) {
   // a job that is genuinely dead and renders "interrupted"/"error"/"done"
   // — dead work resumed from a saved session reads as interrupted, never
   // stuck "running" forever (UXI-04).
-  if (!events?.length) return { messages: _convertHistory(messages), pendingJobs: {} }
+  if (!prepared?.events?.length) {
+    return {
+      messages: _convertHistory(messages),
+      pendingJobs: {},
+      events: prepared?.events || [],
+      branchMetadata: prepared?.branchMetadata || null,
+    }
+  }
 
-  events = _dedupeAdjacentDuplicateEvents(events)
-  const { byTurn, liveIds, branchSelection } = _collectBranchMetadata(events, branchView)
+  const events = prepared.events
+  const { byTurn, liveIds, branchSelection } = prepared.branchMetadata
 
   // Pre-pass: compact_replace ranges hide every event whose event_id
   // falls inside the replaced range. Mirrors Python replay_conversation
@@ -563,6 +591,7 @@ export function _replayEvents(messages, events, branchView = null) {
   // Track job lifecycle: started jobs and completed jobs
   const startedJobs = {} // jobId -> tool part reference
   const completedJobs = new Set() // jobIds that received done/error
+  const interactiveMessages = new Map()
 
   // Positional ids ("h_" + result.length) shift whenever an earlier
   // event is hidden (compact_replace ranges, branch filtering), which
@@ -907,6 +936,38 @@ export function _replayEvents(messages, events, branchView = null) {
         injectedMidTurn: true,
         timestamp: "",
       })
+    } else if (["ask_text", "confirm", "selection", "card"].includes(t)) {
+      const uiEventId = evt.ui_event_id ?? evt.payload?.event_id
+      if (!uiEventId) continue
+      cur = null
+      const message = {
+        id: `ui_${uiEventId}`,
+        role: "ui_event",
+        uiEventType: t,
+        eventId: uiEventId,
+        payload: evt.payload || {},
+        interactive: !!evt.interactive,
+        surface: evt.surface || "chat",
+        tab,
+        timestamp: "",
+        replied: false,
+        superseded: false,
+        timedOut: false,
+        repliedActionId: "",
+        repliedValues: null,
+      }
+      result.push(message)
+      interactiveMessages.set(uiEventId, message)
+    } else if (t === "ui_supersede" || t === "timeout") {
+      const uiEventId = evt.ui_event_id ?? evt.payload?.event_id
+      const target = interactiveMessages.get(uiEventId)
+      if (target && !target.replied) target.superseded = true
+    } else if (t === "ui_reply_ack") {
+      const uiEventId = evt.ui_event_id ?? evt.payload?.event_id
+      const target = interactiveMessages.get(uiEventId)
+      if (target && ["accepted", "superseded"].includes(evt.status)) {
+        target.superseded = true
+      }
     } else if (t === "processing_start") {
       cur = {
         id: stableId("h_"),
@@ -1103,6 +1164,7 @@ export function _replayEvents(messages, events, branchView = null) {
           // Forward it so updateTool's resultMeta picks it up — that's
           // what the canvas store later reads (Feat 1).
           canvas_preview: evt.canvas_preview,
+          tool_metadata: evt.tool_metadata,
         },
         evt.call_id || evt.job_id,
       )
@@ -1422,7 +1484,13 @@ export function _replayEvents(messages, events, branchView = null) {
     }
   }
 
-  return { messages: result, pendingJobs, branchMeta: { byTurn, branchSelection } }
+  return {
+    messages: result,
+    pendingJobs,
+    events,
+    branchMetadata: prepared.branchMetadata,
+    branchMeta: { byTurn, branchSelection },
+  }
 }
 
 function _parseArgs(args) {
@@ -1630,6 +1698,7 @@ const _chatStoreOptions = {
     runningJobs: {},
     /** @type {Object<string, number>} Unread message counts per tab */
     unreadCounts: {},
+    attentionByTab: {},
     /**
      * Per-tab raw event log cached from the last ``getHistory`` so
      * branch navigation can re-replay without a network round-trip.
@@ -1656,12 +1725,14 @@ const _chatStoreOptions = {
     _pendingCommandResultContextsByTab: {},
     _commandResultDispatchSeq: 0,
 
-    /** @type {{sessionId: string, model: string, llmName: string, agentName: string, compactThreshold: number, homeNode: string}} Session metadata */
+    /** Primary creature session metadata, including runtime and config identities. */
     sessionInfo: {
       sessionId: "",
       model: "",
       llmName: "",
       agentName: "",
+      configName: "",
+      configRef: "",
       compactThreshold: 0,
       // Lab cluster site that hosts this session ("_host" or
       // worker-id). Set from the session payload at attach time.
@@ -1674,7 +1745,7 @@ const _chatStoreOptions = {
      * creature — before this map existed, every display surface read
      * the global object, so switching to another creature's tab kept
      * showing the primary's model.
-     * @type {Object<string, {model: string, llmName: string, maxContext: number, compactThreshold: number}>}
+     * @type {Object<string, {model: string, llmName: string, configName: string, configRef: string, maxContext: number, compactThreshold: number}>}
      */
     modelByTab: {},
     /** Real creature name behind the ``root`` tab alias (recipe
@@ -1866,15 +1937,20 @@ const _chatStoreOptions = {
      * session-level (primary creature) values when the per-tab entry
      * hasn't been populated yet. Numeric fields treat 0 as unknown.
      */
-    activeModelInfo(state) {
+    activeCreatureInfo(state) {
       const tab = state.activeTab
       const info = (tab && state.modelByTab[tab]) || {}
       return {
         model: info.model || state.sessionInfo.model || "",
         llmName: info.llmName || state.sessionInfo.llmName || "",
+        configName: info.configName || state.sessionInfo.configName || "",
+        configRef: info.configRef || state.sessionInfo.configRef || "",
         maxContext: info.maxContext || state.sessionInfo.maxContext || 0,
         compactThreshold: info.compactThreshold || state.sessionInfo.compactThreshold || 0,
       }
+    },
+    activeModelInfo() {
+      return this.activeCreatureInfo
     },
     /**
      * Canonical display form of the ACTIVE tab's model, preferring the
@@ -1905,6 +1981,14 @@ const _chatStoreOptions = {
   },
 
   actions: {
+    markAttentionRead(tabKey) {
+      if (!this.attentionByTab[tabKey]) return
+      this.attentionByTab[tabKey] = markAttentionRead(this.attentionByTab[tabKey])
+      publishAttention(scopeOfStoreId(this.$id) || "default", tabKey, this.attentionByTab[tabKey])
+    },
+    attentionSummary(tabKey) {
+      return attentionSummary(this.attentionByTab[tabKey] || createAttentionState())
+    },
     /**
      * Public resync — re-fetch and rebuild the active tab's history.
      * Idempotent and cheap; safe to call from focus-change listeners,
@@ -1968,6 +2052,8 @@ const _chatStoreOptions = {
       this.subagentUsageByJob = {}
       this.runningJobs = {}
       this.unreadCounts = {}
+      this.attentionByTab = {}
+      removeAttentionScope(scopeOfStoreId(this.$id) || "default")
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this._recentUserInputs = {}
@@ -1997,7 +2083,9 @@ const _chatStoreOptions = {
         sessionId: instance.session_id || instance.id || "",
         model: instance.model || "",
         llmName: instance.llm_name || instance.model || "",
-        agentName: instance.config_name || instance.creatures?.[0]?.name || "",
+        agentName: instance.creatures?.[0]?.name || "",
+        configName: instance.creature_config_name || instance.creatures?.[0]?.config_name || "",
+        configRef: instance.config_ref || instance.creatures?.[0]?.config_ref || "",
         compactThreshold: instance.compact_threshold || 0,
         maxContext: instance.max_context || 0,
         // Cluster site this session runs on.  Backend payload now
@@ -2019,6 +2107,8 @@ const _chatStoreOptions = {
         const info = {
           model: c.model || "",
           llmName: c.llm_name || c.model || "",
+          configName: c.config_name || "",
+          configRef: c.config_ref || "",
           maxContext: c.max_context || 0,
           compactThreshold: c.compact_threshold || 0,
         }
@@ -2637,13 +2727,14 @@ const _chatStoreOptions = {
     },
 
     /** Restore token usage from event log (for page refresh) */
-    _restoreTokenUsage(source, events) {
+    _restoreTokenUsage(source, events, alreadyDeduped = false) {
       // Canonical history is authoritative — rebuild this source's total
       // from scratch so a reconnect (which re-runs _loadHistory on the
       // same generation) does not add the persisted token_usage rows a
       // second time and double the count.
       this.tokenUsage[source] = { prompt: 0, completion: 0, total: 0, cached: 0, lastPrompt: 0 }
-      for (const evt of _dedupeAdjacentDuplicateEvents(events)) {
+      const normalizedEvents = alreadyDeduped ? events : _dedupeAdjacentDuplicateEvents(events)
+      for (const evt of normalizedEvents) {
         const isTokenEvt =
           (evt.type === "activity" && evt.activity_type === "token_usage") ||
           evt.type === "token_usage"
@@ -2689,6 +2780,23 @@ const _chatStoreOptions = {
     /** Handle ALL incoming WS messages */
     _onMessage(data) {
       const source = this._tabForSource(data.source || "")
+      if (source) {
+        if (
+          ["ask_text", "confirm", "selection", "card", "ui_supersede", "ui_reply_ack"].includes(
+            data.type,
+          )
+        ) {
+          this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+        }
+        const scope = scopeOfStoreId(this.$id) || "default"
+        const { state } = reduceAttentionEdge(
+          this.attentionByTab[source] || createAttentionState(),
+          data,
+          { scope, tab: source },
+        )
+        this.attentionByTab[source] = state
+        publishAttention(scope, source, state)
+      }
 
       if (data.type === "user_input") {
         this._handleUserInput(source, data)
@@ -3011,6 +3119,8 @@ const _chatStoreOptions = {
         const info = {}
         if (data.model) info.model = data.model
         if (data.llm_name) info.llmName = data.llm_name
+        if (data.config_name) info.configName = data.config_name
+        if (data.config_ref) info.configRef = data.config_ref
         if (data.max_context != null) info.maxContext = data.max_context
         if (data.compact_threshold != null) info.compactThreshold = data.compact_threshold
         const tab = source || data.agent_name || ""
@@ -3028,6 +3138,8 @@ const _chatStoreOptions = {
           if (data.model) this.sessionInfo.model = data.model
           if (data.llm_name) this.sessionInfo.llmName = data.llm_name
           if (data.agent_name) this.sessionInfo.agentName = data.agent_name
+          if (data.config_name) this.sessionInfo.configName = data.config_name
+          if (data.config_ref) this.sessionInfo.configRef = data.config_ref
           if (data.max_context != null) this.sessionInfo.maxContext = data.max_context
           if (data.compact_threshold != null)
             this.sessionInfo.compactThreshold = data.compact_threshold
@@ -4384,10 +4496,17 @@ const _chatStoreOptions = {
         // wiping ``branchViewByTab`` here was the historical source of
         // "I switched to branch 1 of turn 2, did an unrelated action,
         // and was yanked back to the latest branch."
-        this.eventsByTab[tab] = _dedupeAdjacentDuplicateEvents(data.events)
         if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-        this._restoreTokenUsage(tab, this.eventsByTab[tab])
-        this._rebuildMessages(tab, fetchedAt)
+        const prepared = _prepareReplayEvents(data.events, this.branchViewByTab[tab])
+        this.eventsByTab[tab] = prepared.events
+        this._restoreTokenUsage(tab, prepared.events, true)
+        this._rebuildMessages(tab, fetchedAt, prepared)
+        const scope = scopeOfStoreId(this.$id) || "default"
+        this.attentionByTab[tab] = restoreAttentionFromHistory(
+          this.eventsByTab[tab],
+          this.attentionByTab[tab] || createAttentionState(),
+        )
+        publishAttention(scope, tab, this.attentionByTab[tab])
         // Advance the applied-history watermark so a later out-of-order
         // response carrying an older snapshot is rejected above.
         if (incomingMax != null) this._appliedMaxEventIdByTab[tab] = incomingMax
@@ -4407,15 +4526,18 @@ const _chatStoreOptions = {
      * Rebuild ``messagesByTab[tab]`` from the cached event log,
      * applying the current ``branchViewByTab[tab]`` override.
      */
-    _rebuildMessages(tab, fetchedAt = null) {
+    _rebuildMessages(tab, fetchedAt = null, prepared = null) {
       const events = this.eventsByTab[tab]
       if (!events) return
       const branchView = this.branchViewByTab[tab] || null
       // Canonical history is the liveness authority (see _loadHistory):
       // the backend withholds synthetic terminals for still-live jobs,
       // so a terminal in the cached log means the job is dead.
-      const { messages, pendingJobs } = _replayEvents([], events, branchView)
-      const branchSelection = _commandResultBranchSelection(events, branchView)
+      const replay = prepared
+        ? _replayPreparedEvents([], prepared, tab)
+        : _replayEvents([], events, branchView, tab)
+      const { messages, pendingJobs } = replay
+      const branchSelection = replay.branchMetadata.branchSelection
       adoptLocalCommandResultSelections(
         this._pendingCommandResultContextsByTab[tab],
         this._localCommandResultsByTab[tab],
@@ -5052,6 +5174,8 @@ const _chatStoreOptions = {
       this.subagentUsageByJob = {}
       this.runningJobs = {}
       this.unreadCounts = {}
+      this.attentionByTab = {}
+      removeAttentionScope(scopeOfStoreId(this.$id) || "default")
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.eventsByTab = {}
@@ -5078,6 +5202,8 @@ const _chatStoreOptions = {
         model: "",
         llmName: "",
         agentName: "",
+        configName: "",
+        configRef: "",
         compactThreshold: 0,
         maxContext: 0,
         homeNode: "_host",
@@ -5522,6 +5648,7 @@ function _factoryFor(scope) {
       // ("default") lives forever — v1 never explicitly disposes.
       registerScopeDisposer(scope, () => {
         try {
+          removeAttentionScope(scope)
           useFn()._cleanup?.()
           useFn().$dispose?.()
         } catch {

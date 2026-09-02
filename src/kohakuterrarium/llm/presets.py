@@ -54,6 +54,18 @@ PRESETS: dict[str, dict[str, Any]] = {
     #  fast mode (priority tier). The Codex/GPT lines merged at
     #  5.4 — there is no separate ``-codex`` model anymore.
     # ═══════════════════════════════════════════════════════
+    "gpt-5.3-codex-spark": {
+        "provider": "codex",
+        "model": "gpt-5.3-codex-spark",
+        # Subscription-only research preview metadata from Codex's model catalog.
+        "max_context": 128000,
+        # Codex OAuth currently lets the backend choose the actual output cap.
+        "max_output": 65536,
+        "reasoning_effort": "high",
+        # Spark is text-only; do not inherit Codex's provider-wide image tool.
+        "provider_native_tools": [],
+        "variation_groups": {"reasoning": _CODEX_REASONING_GROUP},
+    },
     "gpt-5.6-sol": {
         "provider": "codex",
         "model": "gpt-5.6-sol",
@@ -666,8 +678,8 @@ PRESETS: dict[str, dict[str, Any]] = {
     # ═══════════════════════════════════════════════════════
     #  GLM Coding Plan Direct API (Anthropic-compatible).
     #  GLM's Anthropic-compatible endpoint uses Bearer-token auth.
-    #  GLM-5.2 ids are lowercase; the 1M-context variant is a
-    #  SEPARATE model id with a literal ``[1m]`` suffix.
+    #  Model ids are lowercase. The 1M selectors change the local
+    #  context budget while keeping the supported base API model ids.
     # ═══════════════════════════════════════════════════════
     "glm-5.2": {
         "provider": "glm-coding",
@@ -678,7 +690,35 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
     "glm-5.2-1m": {
         "provider": "glm-coding",
-        "model": "glm-5.2[1m]",
+        "model": "glm-5.2",
+        "max_context": 1000000,
+        "max_output": 131072,
+        "extra_body": {"auth_as_bearer": True},
+    },
+    "glm-5.3": {
+        "provider": "glm-coding",
+        "model": "glm-5.3",
+        "max_context": 262144,
+        "max_output": 131072,
+        "extra_body": {"auth_as_bearer": True},
+    },
+    "glm-5.3-1m": {
+        "provider": "glm-coding",
+        "model": "glm-5.3",
+        "max_context": 1000000,
+        "max_output": 131072,
+        "extra_body": {"auth_as_bearer": True},
+    },
+    "glm-5.3-flash": {
+        "provider": "glm-coding",
+        "model": "glm-5.3-flash",
+        "max_context": 262144,
+        "max_output": 131072,
+        "extra_body": {"auth_as_bearer": True},
+    },
+    "glm-5.3-flash-1m": {
+        "provider": "glm-coding",
+        "model": "glm-5.3-flash",
         "max_context": 1000000,
         "max_output": 131072,
         "extra_body": {"auth_as_bearer": True},
@@ -730,6 +770,22 @@ PRESETS: dict[str, dict[str, Any]] = {
         "max_context": 1048576,
         "extra_body": {"reasoning": {"enabled": True}},
         "variation_groups": {"reasoning": _OR_REASONING_TOGGLE_GROUP},
+    },
+    # ═══════════════════════════════════════════════════════
+    #  xAI Grok via a reusable local subscription login.
+    #  Keep this explicit suffix separate from OpenRouter/API billing.
+    # ═══════════════════════════════════════════════════════
+    "grok-4.6-subscription": {
+        "provider": "grok-subscription",
+        "model": "grok-4.6",
+        "max_context": 500000,
+        "max_output": 65536,
+    },
+    "grok-4.5-subscription": {
+        "provider": "grok-subscription",
+        "model": "grok-4.5",
+        "max_context": 500000,
+        "max_output": 65536,
     },
     # ═══════════════════════════════════════════════════════
     #  xAI Grok series (OpenRouter).

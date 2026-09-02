@@ -134,6 +134,7 @@
             <template v-for="(part, i) in message.contentParts" :key="i">
               <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :breaks="true" />
               <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="chat-inline-image" />
+              <VideoFilePreview v-else-if="part.type === 'file' && part.file?.mime?.startsWith('video/')" :file="part.file" />
               <div v-else-if="part.type === 'file'" class="px-3 py-2 rounded-lg border border-aquamarine/20 bg-aquamarine/5 text-xs text-warm-600 dark:text-warm-300">
                 <span class="i-carbon-document mr-1 text-aquamarine" />
                 {{ part.file?.name || part.file?.path || "file" }}
@@ -182,11 +183,16 @@
         <!-- Pass-through part -->
         <template v-if="group.type === 'part'">
           <div v-if="group.part.type === 'reasoning'" class="mb-1.5">
-            <details class="rounded-lg border border-iolite/20 dark:border-iolite/25 bg-iolite/5 dark:bg-iolite/10 px-2 py-1">
+            <details class="reasoning-details rounded-lg border border-iolite/20 dark:border-iolite/25 bg-iolite/5 dark:bg-iolite/10 px-2 py-1" @toggle="setReasoningExpanded(groupKey(group, gi), $event.currentTarget.open)">
               <summary class="text-xs text-iolite dark:text-iolite-light cursor-pointer select-none">
-                Thinking<span v-if="group.part.source" class="ml-1 text-warm-400">· {{ group.part.source }}</span>
+                <span class="reasoning-summary-row inline-flex items-center gap-2 min-w-0 align-middle">
+                  <span class="shrink-0"
+                    >Thinking<span v-if="group.part.source" class="ml-1 text-warm-400">· {{ group.part.source }}</span></span
+                  >
+                  <span class="reasoning-preview truncate flex-1 min-w-0 text-warm-600 dark:text-warm-400 font-mono">{{ reasoningPreview(group.part) }}</span>
+                </span>
               </summary>
-              <pre class="mt-2 text-xs whitespace-pre-wrap break-words font-mono text-warm-700 dark:text-warm-300 max-h-60 overflow-y-auto">{{ reasoningText(group.part) }}</pre>
+              <pre v-if="expandedReasoning.has(groupKey(group, gi))" class="reasoning-full mt-2 text-xs whitespace-pre-wrap break-words font-mono text-warm-700 dark:text-warm-300 max-h-60 overflow-y-auto">{{ reasoningText(group.part) }}</pre>
             </details>
           </div>
           <div v-if="group.part.type === 'text' && group.part.content" class="text-body mb-1">
@@ -261,6 +267,7 @@
           <template v-for="(part, i) in message.contentParts" :key="i">
             <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :breaks="true" />
             <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="chat-inline-image" />
+            <VideoFilePreview v-else-if="part.type === 'file' && part.file?.mime?.startsWith('video/')" :file="part.file" />
             <div v-else-if="part.type === 'file'" class="px-3 py-2 rounded-lg border border-aquamarine/20 bg-aquamarine/5 text-xs text-warm-600 dark:text-warm-300">
               <span class="i-carbon-document mr-1 text-aquamarine" />
               {{ part.file?.name || part.file?.path || "file" }}
@@ -283,6 +290,7 @@ import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
 import CommandResultMessage from "@/components/chat/CommandResultMessage.vue"
 import ToolCallBatch from "@/components/chat/ToolCallBatch.vue"
 import ToolCallBlock from "@/components/chat/ToolCallBlock.vue"
+import VideoFilePreview from "@/components/chat/VideoFilePreview.vue"
 import UIEventBlock from "@/components/chat/UIEventBlock.vue"
 import SiteChip from "@/components/cluster/SiteChip.vue"
 import { useChatStore } from "@/stores/chat"
@@ -332,6 +340,7 @@ const props = defineProps({
 })
 
 const expandedTools = reactive({})
+const expandedReasoning = reactive(new Set())
 const editing = ref(false)
 
 // Group consecutive non-subagent tool parts into a single batch so a
@@ -368,9 +377,25 @@ function toggleTool(id) {
   expandedTools[id] = !expandedTools[id]
 }
 
+const REASONING_PREVIEW_CHARS = 240
+
+function reasoningPreview(part) {
+  const text = part?.text || ""
+  if (text.length <= REASONING_PREVIEW_CHARS) return text
+  const preview = text.slice(0, REASONING_PREVIEW_CHARS)
+  const lastCodeUnit = preview.charCodeAt(preview.length - 1)
+  return `${lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff ? preview.slice(0, -1) : preview}…`
+}
+
+function setReasoningExpanded(key, open) {
+  if (open) expandedReasoning.add(key)
+  else expandedReasoning.delete(key)
+}
+
 function reasoningText(part) {
-  if (!part?.text) return ""
-  return part.signature ? `${part.text}\n[signature: ${part.signature}]` : part.text
+  const text = part?.text || ""
+  if (!part?.signature) return text
+  return text ? `${text}\n[signature: ${part.signature}]` : `[signature: ${part.signature}]`
 }
 
 // Phase B UI event reply: forward to chat store, which sends
@@ -567,6 +592,14 @@ function goToNextAssistantBranch() {
 </script>
 
 <style scoped>
+.reasoning-summary-row {
+  max-width: calc(100% - 1rem);
+}
+
+.reasoning-details[open] .reasoning-preview {
+  display: none;
+}
+
 .chat-inline-image {
   display: block;
   max-width: min(65%, 42vw);

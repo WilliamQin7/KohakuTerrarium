@@ -183,9 +183,31 @@ class TestPresetsDataIntegrity:
 
     def test_codex_presets_use_codex_provider(self):
         # the headline ChatGPT-subscription presets bind to the codex provider
+        assert PRESETS["gpt-5.3-codex-spark"]["provider"] == "codex"
         assert PRESETS["gpt-5.4"]["provider"] == "codex"
         assert PRESETS["gpt-5.5"]["provider"] == "codex"
         assert PRESETS["gpt-5.6-sol"]["provider"] == "codex"
+
+    def test_codex_spark_uses_subscription_catalog_defaults(self):
+        preset = PRESETS["gpt-5.3-codex-spark"]
+        assert preset["model"] == "gpt-5.3-codex-spark"
+        assert preset["max_context"] == 128000
+        assert preset["max_output"] == 65536
+        assert preset["reasoning_effort"] == "high"
+        assert preset["provider_native_tools"] == []
+        assert set(preset["variation_groups"]["reasoning"]) == {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        }
+        assert "service_tier" not in preset
+        assert "websocket_mode" not in preset.get("extra_body", {})
+
+        all_presets = get_all_presets()
+        assert ("codex", "gpt-5.3-codex-spark") in all_presets
+        assert ("openai", "gpt-5.3-codex-spark") not in all_presets
+        assert ("openrouter", "gpt-5.3-codex-spark") not in all_presets
 
     def test_gpt56_effort_scales_top_out_at_max(self):
         # ``ultra`` is deliberately not exposed on any GPT-5.6 variant:
@@ -292,10 +314,14 @@ class TestPresetsDataIntegrity:
         assert preset["max_context"] == 262144
         assert preset["max_output"] == 32768
 
-    def test_glm_coding_direct_presets_use_bearer_auth(self):
+    def test_glm_coding_direct_presets_use_supported_model_id_and_bearer_auth(self):
         expected = {
             "glm-5.2": ("glm-5.2", 262144, 131072),
-            "glm-5.2-1m": ("glm-5.2[1m]", 1000000, 131072),
+            "glm-5.2-1m": ("glm-5.2", 1000000, 131072),
+            "glm-5.3": ("glm-5.3", 262144, 131072),
+            "glm-5.3-1m": ("glm-5.3", 1000000, 131072),
+            "glm-5.3-flash": ("glm-5.3-flash", 262144, 131072),
+            "glm-5.3-flash-1m": ("glm-5.3-flash", 1000000, 131072),
         }
         for name, (model, max_context, max_output) in expected.items():
             preset = PRESETS[name]

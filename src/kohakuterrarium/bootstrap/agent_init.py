@@ -14,7 +14,6 @@ from kohakuterrarium.bootstrap.tools import init_tools
 from kohakuterrarium.bootstrap.triggers import init_triggers
 from kohakuterrarium.builtins.plugin_catalog import resolve_plugin_specs
 from kohakuterrarium.builtins.tool_catalog import get_builtin_tool
-from kohakuterrarium.builtins.tools.skill import SkillTool
 from kohakuterrarium.builtins.user_commands import (
     get_builtin_user_command,
     list_builtin_user_commands,
@@ -95,6 +94,7 @@ class AgentInitMixin:
     def _init_registry(self) -> None:
         """Register configured tools, remove unsupported native tools, then inject offered ones."""
         self.registry = Registry()
+        self._auto_provider_tools: set[str] = set()
         init_tools(
             self.config,
             self.registry,
@@ -155,6 +155,11 @@ class AgentInitMixin:
                 )
                 continue
             self.registry.register_tool(tool)
+            auto_tools = getattr(self, "_auto_provider_tools", None)
+            if auto_tools is None:
+                auto_tools = set()
+                self._auto_provider_tools = auto_tools
+            auto_tools.add(name)
             logger.info(
                 "provider_native_tool_injected",
                 tool_name=name,
@@ -400,6 +405,8 @@ class AgentInitMixin:
         tool = get_builtin_tool("skill")
         if tool is None:
             try:
+                from kohakuterrarium.builtins.tools.skill import SkillTool
+
                 tool = SkillTool()
             except Exception as exc:
                 logger.warning(

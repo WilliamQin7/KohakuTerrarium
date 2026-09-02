@@ -35,6 +35,8 @@ import { useAutoTriggers } from "@/composables/useAutoTriggers"
 import { useBuiltinCommands } from "@/composables/useBuiltinCommands"
 import { useConnectIntent } from "@/composables/useConnectIntent"
 import { useDensity } from "@/composables/useDensity"
+import { useDocumentAttention } from "@/composables/useDocumentAttention"
+import { useAttentionEffects } from "@/composables/useAttentionEffects"
 import { useKeyboardShortcuts } from "@/composables/useKeyboardShortcuts"
 import { useAuthStore } from "@/stores/auth"
 import { useHostsStore } from "@/stores/hosts"
@@ -42,6 +44,7 @@ import { useInstancesStore } from "@/stores/instances"
 import { useLocaleStore } from "@/stores/locale"
 import { useThemeStore } from "@/stores/theme"
 import { useTabsStore } from "@/stores/tabs"
+import { installExternalLinkGuard } from "@/utils/externalLinks"
 
 const theme = useThemeStore()
 const locale = useLocaleStore()
@@ -76,6 +79,8 @@ const instances = useInstancesStore()
 instances.fetchAll()
 
 useKeyboardShortcuts()
+useDocumentAttention()
+useAttentionEffects()
 useBuiltinCommands()
 useAutoTriggers()
 useArtifactDetector()
@@ -100,6 +105,10 @@ function openSavedSessionHistory(event) {
 if (typeof window !== "undefined") {
   window.addEventListener("kt-open-host-picker", openHostPicker)
   window.addEventListener("kt:open-saved-session-history", openSavedSessionHistory)
+  // Backstop for anchors the markdown renderers don't own: the pywebview
+  // shell has no back button, so a same-window external navigation is a
+  // dead end.
+  const uninstallExternalLinkGuard = installExternalLinkGuard()
   // Auto-open when an Android ``ktconnect://`` deep-link is
   // queued — the modal's own watcher will consume + apply the URI.
   const { pendingUri } = useConnectIntent()
@@ -109,6 +118,7 @@ if (typeof window !== "undefined") {
   onBeforeUnmount(() => {
     window.removeEventListener("kt-open-host-picker", openHostPicker)
     window.removeEventListener("kt:open-saved-session-history", openSavedSessionHistory)
+    uninstallExternalLinkGuard()
   })
 }
 </script>

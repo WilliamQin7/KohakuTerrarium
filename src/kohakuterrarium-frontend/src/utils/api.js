@@ -701,6 +701,28 @@ export const filesAPI = {
  *  are kept for the per-creature URL methods.
  */
 export const sessionAPI = {
+  async getSubagentConversation(session, { parent, jobId, name, run } = {}) {
+    const params = { parent }
+    if (jobId) params.job_id = jobId
+    if (name) params.name = name
+    if (run != null) params.run = run
+    const { data } = await api.get(`/sessions/${encodeTarget(session)}/subagents/conversation`, {
+      params,
+    })
+    return data
+  },
+
+  async listSubagents(session, { parent, jobId, name } = {}) {
+    const params = {}
+    if (parent) params.parent = parent
+    if (jobId) params.job_id = jobId
+    if (name) params.name = name
+    const { data } = await api.get(`/sessions/${encodeTarget(session)}/subagents`, {
+      params,
+    })
+    return data
+  },
+
   /** Conversations that are still open, whether live or dormant. */
   async listOpen() {
     const { data } = await api.get("/sessions/open")
@@ -1123,6 +1145,10 @@ export const settingsAPI = {
     const { data } = await api.get("/settings/codex-status", _nodeQuery(node))
     return data
   },
+  async getGrokStatus(node = "_host") {
+    const { data } = await api.get("/settings/grok-status", _nodeQuery(node))
+    return data
+  },
   async codexLogin(node = "_host") {
     const cfg = { timeout: 300000, ..._nodeQuery(node) }
     const { data } = await api.post("/settings/codex-login", {}, cfg)
@@ -1272,7 +1298,7 @@ export const extensionsAPI = {
 
 /** Process-wide stats surface (Stats tab). */
 export const statsAPI = {
-  /** @returns {Promise<{count, total_bytes, oldest_at, newest_at, session_dir}>} */
+  /** @returns {Promise<{count, session_bytes, artifacts_bytes, total_bytes, oldest_at, newest_at, session_dir}>} */
   async diskUsage() {
     const { data } = await api.get("/sessions/disk-usage")
     return data

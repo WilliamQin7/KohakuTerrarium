@@ -63,6 +63,47 @@ class _EchoTool(BaseTool):
         return ToolResult(output=str(args.get("msg", "")))
 
 
+@pytest.mark.asyncio
+async def test_agent_build_path_reuses_one_package_snapshot(tmp_path, monkeypatch):
+    from kohakuterrarium.packages import walk
+
+    (tmp_path / "config.yaml").write_text(
+        "name: built\ninput:\n  type: none\noutput:\n  type: stdout\n",
+        encoding="utf-8",
+    )
+    calls = 0
+    original = walk._list_packages_uncached
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(walk, "_list_packages_uncached", counted)
+
+    await Agent.build(tmp_path, llm=ScriptedLLM(["ok"]))
+
+    assert calls == 1
+
+
+def test_agent_build_reuses_one_package_snapshot(make_agent, monkeypatch):
+    from kohakuterrarium.packages import walk
+
+    calls = 0
+    original = walk._list_packages_uncached
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(walk, "_list_packages_uncached", counted)
+
+    make_agent()
+
+    assert calls == 1
+
+
 # ── fixtures ─────────────────────────────────────────────────────
 
 
@@ -5788,13 +5829,19 @@ class TestMidTurnBatchDrain:
             for evt in [
                 TriggerEvent(type="user_input", content="hello"),
                 create_tool_complete_event(job_id="bash_1", content="tool out"),
+                create_tool_complete_event(
+                    job_id="bash_2",
+                    content="partial",
+                    exit_code=3,
+                    error="permission denied",
+                ),
                 TriggerEvent(
                     type="subagent_output", content="sub out", job_id="agent_x"
                 ),
             ]:
                 agent._event_inbox.put(EventEnvelope(evt))
             count = await agent._drain_mid_turn_pending_inputs(agent.controller)
-            assert count == 3
+            assert count == 4
             user_msgs = [
                 m
                 for m in agent.controller.conversation.get_messages()
@@ -5803,6 +5850,10 @@ class TestMidTurnBatchDrain:
             combined = user_msgs[-1].content
             assert "hello" in combined
             assert "[Tool bash_1 completed]\ntool out" in combined
+            assert (
+                "[Tool bash_2 failed, exit 3]\nError: permission denied\npartial"
+                in combined
+            )
             assert "[Sub-agent agent_x output]\nsub out" in combined
             # Only the user-facing entry records a queued-banner frame —
             # tool/sub-agent completions already have their own

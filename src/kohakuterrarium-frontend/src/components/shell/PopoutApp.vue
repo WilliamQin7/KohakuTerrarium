@@ -18,12 +18,13 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from "vue"
+import { computed, onMounted, onScopeDispose } from "vue"
 
 import AuthGate from "@/components/auth/AuthGate.vue"
 import ToastCenter from "@/components/chrome/ToastCenter.vue"
 import AttachTab from "@/components/shell/tabs/AttachTab.vue"
 import { useWindowChrome } from "@/composables/useWindowChrome"
+import { acquireScope, releaseScope } from "@/composables/useScope"
 import { useInstancesStore } from "@/stores/instances"
 import { usePopoutWorkFocus } from "@/ext/workFocus"
 import { ackPopoutWindow, returnPopoutWindow } from "@/utils/hostBridge"
@@ -33,6 +34,9 @@ import { useI18n } from "@/utils/i18n"
 const props = defineProps({
   scope: { type: String, required: true },
 })
+const sessionScope = props.scope
+acquireScope(sessionScope)
+onScopeDispose(() => releaseScope(sessionScope))
 
 useWindowChrome()
 const { t } = useI18n()

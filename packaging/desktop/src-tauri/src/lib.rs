@@ -18,6 +18,7 @@ mod opens;
 mod os;
 mod overlay;
 mod overlay_placement;
+mod overlay_store;
 mod overlay_viewport;
 mod popout;
 mod runtime;
@@ -25,6 +26,7 @@ mod settings;
 mod smoke;
 mod summon;
 mod tray;
+mod ui_context;
 mod updater;
 mod window;
 
@@ -59,7 +61,11 @@ pub fn run() {
                 let targets = opens::from_arguments(args.get(1..).unwrap_or_default(), &directory);
                 opens::deliver(app, targets);
             }))
-            .plugin(tauri_plugin_window_state::Builder::default().build());
+            .plugin(
+                tauri_plugin_window_state::Builder::default()
+                    .with_filter(|label| !overlay::is_overlay_label(label))
+                    .build(),
+            );
     }
     if !headless || smoke::summon_probe_requested() {
         builder = builder.plugin(
@@ -87,6 +93,7 @@ pub fn run() {
         .manage(overlay::HitRegions::default())
         .manage(opens::PendingOpens::default())
         .manage(ShellSettings::default())
+        .manage(overlay_store::OverlayGeometry::default())
         .manage(tray::TrayState::default())
         .manage(popout::PopoutRegistry::default())
         .manage(os::keep_awake::KeepAwakeState::default())
@@ -115,6 +122,8 @@ pub fn run() {
             overlay::overlay_set_hit_regions,
             overlay::overlay_ack,
             hud::focus_session,
+            ui_context::relay_work_context,
+            ui_context::navigate_main,
             tray::get_close_to_tray,
             tray::set_close_to_tray,
             attention::set_attention_state,
@@ -151,8 +160,23 @@ pub fn run() {
             },
         )
         .on_window_event(|window, event| {
+            if overlay::is_overlay_label(window.label()) {
+                if let Some(view) = window.app_handle().get_webview_window(window.label()) {
+                    match event {
+                        tauri::WindowEvent::Moved(_)
+                        | tauri::WindowEvent::Resized(_)
+                        | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                            overlay_store::changed(view)
+                        }
+                        tauri::WindowEvent::CloseRequested { .. } => overlay_store::closing(&view),
+                        _ => {}
+                    }
+                }
+                return;
+            }
             if popout::is_popout_label(window.label()) {
                 if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                    ui_context::popout_closed(window.app_handle(), window.label());
                     window
                         .app_handle()
                         .state::<popout::PopoutRegistry>()

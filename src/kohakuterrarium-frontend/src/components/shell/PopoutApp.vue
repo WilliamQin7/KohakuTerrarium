@@ -25,6 +25,7 @@ import ToastCenter from "@/components/chrome/ToastCenter.vue"
 import AttachTab from "@/components/shell/tabs/AttachTab.vue"
 import { useWindowChrome } from "@/composables/useWindowChrome"
 import { useInstancesStore } from "@/stores/instances"
+import { usePopoutWorkFocus } from "@/ext/workFocus"
 import { ackPopoutWindow, returnPopoutWindow } from "@/utils/hostBridge"
 import { useI18n } from "@/utils/i18n"
 
@@ -42,6 +43,7 @@ const title = computed(() => {
   const instance = match(instances.current) ? instances.current : instances.list.find(match)
   return instance?.session_name || instance?.config_name || "KohakuTerrarium"
 })
+usePopoutWorkFocus(props.scope, title)
 
 function returnToMain() {
   void returnPopoutWindow(true)

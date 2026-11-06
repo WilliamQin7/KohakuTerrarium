@@ -7,7 +7,7 @@
  * copy ``kt extension new --ui`` places in ``ui/test/kt-sdk/``.
  */
 
-import { computed, reactive, ref, shallowRef } from "vue"
+import { computed, reactive, ref, shallowRef, toValue } from "vue"
 
 import {
   FRAME_MESSAGES,
@@ -91,6 +91,7 @@ export function createMockHost(options = {}) {
     creature: options.creature ?? null,
     events: options.events || [],
     work: options.work ?? null,
+    workTargets: options.workTargets || {},
     locale: options.locale || "en",
     dark: options.dark ?? false,
     confirmAnswer: options.confirmAnswer ?? true,
@@ -354,9 +355,14 @@ export function useHost() {
   return computed(() => host.state.host)
 }
 
-export function useWorkContext() {
+export function useWorkContext({ target, enabled = true } = {}) {
   const host = current()
-  return computed(() => host.state.work)
+  return computed(() => {
+    if (!toValue(enabled)) return null
+    if (target === undefined) return host.state.work
+    const selection = toValue(target)
+    return selection ? host.state.workTargets[selection.creatureId] || null : null
+  })
 }
 
 export function useSession() {

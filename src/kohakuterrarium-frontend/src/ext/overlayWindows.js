@@ -16,7 +16,12 @@ import {
   reloadPlacements,
   setWindowAllowed,
 } from "@/ext/overlays"
-import { closeOverlayWindow, openOverlayWindow, overlayWindowsSupported } from "@/utils/hostBridge"
+import {
+  closeOverlayWindow,
+  openOverlayWindow,
+  overlayWindowsSupported,
+  desktopCapabilities,
+} from "@/utils/hostBridge"
 import { makeWindowLabel } from "@/utils/windowLabel"
 
 export const OVERLAY_PARAM = "kt_overlay"
@@ -96,6 +101,7 @@ let _started = false
 export function startOverlayWindows() {
   if (_started || typeof window === "undefined") return
   _started = true
+  void desktopCapabilities()
   watch(
     () =>
       [...overlays.values()]
